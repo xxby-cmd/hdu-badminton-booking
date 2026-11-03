@@ -1,0 +1,13 @@
+.private/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.env
+*.dpapi
+*session*.json
+*status*.json
+*events*.jsonl
+*submitted*.json
+*.log

@@ -1,0 +1,48 @@
+{
+  "measured_at": "2026-11-03T16:51:12.136152+08:00",
+  "local_mock_no_network": {
+    "samples": 5000,
+    "median_ms": 0.024,
+    "p95_ms": 0.0262,
+    "min_ms": 0.0224,
+    "max_ms": 0.1773
+  },
+  "local_mock_with_durable_marker_no_network": {
+    "samples": 200,
+    "median_ms": 5.1349,
+    "p95_ms": 6.1609,
+    "min_ms": 4.5151,
+    "max_ms": 15.8708
+  },
+  "critical_booking_requests_before_order_creation": 2,
+  "live_booking_measured": false,
+  "limitations": [
+    "Mock replies are immediate; they do not measure school processing.",
+    "Read-only latency is measured off peak and is not booking latency.",
+    "No manual-booking baseline has been measured."
+  ],
+  "network_cold_time_query_ms": 332.041,
+  "network_read_only_warm_ms": {
+    "post_server_time": {
+      "samples": 5,
+      "median_ms": 11.622,
+      "p95_ms": 160.355,
+      "min_ms": 5.991,
+      "max_ms": 160.355
+    },
+    "post_venue_info": {
+      "samples": 5,
+      "median_ms": 40.075,
+      "p95_ms": 122.828,
+      "min_ms": 34.153,
+      "max_ms": 122.828
+    },
+    "post_order_info": {
+      "samples": 5,
+      "median_ms": 66.656,
+      "p95_ms": 254.881,
+      "min_ms": 61.305,
+      "max_ms": 254.881
+    }
+  }
+}
