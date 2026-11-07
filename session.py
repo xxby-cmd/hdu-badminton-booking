@@ -1,66 +1,37 @@
-"""Read only the user's sportmeta origin from Chromium's recent local-storage log."""
+"""Read the sportmeta session without modifying Chromium's LevelDB."""
 from pathlib import Path
-import struct
 import json
 import base64
 import ctypes
 from ctypes import wintypes
 import os
+import tempfile
+import math
 from datetime import datetime, timezone
+from leveldb_reader import read_origin, varint, records
 
 ORIGIN = b"_https://sportmeta.hdu.edu.cn\x00"
-DB = Path(os.environ['LOCALAPPDATA']) / 'DingTalk_133/Default/Local Storage/leveldb'
+LOCAL_DATA = Path(os.environ['LOCALAPPDATA'])
+DB = LOCAL_DATA / 'DingTalk_133/Default/Local Storage/leveldb'
 PRIVATE = Path(os.environ.get('HDU_BOOKING_STATE_DIR',str(Path(__file__).resolve().parent / '.private')))
 CACHE = PRIVATE / 'session.dpapi'
 
-def varint(b, pos):
-    value = shift = 0
-    while pos < len(b) and shift <= 63:
-        byte = b[pos]; pos += 1
-        value |= (byte & 127) << shift
-        if byte < 128:
-            return value, pos
-        shift += 7
-    raise ValueError("Incomplete varint")
-
-def records(raw):
-    fragments = bytearray()
-    for block_at in range(0, len(raw), 32768):
-        block = raw[block_at:block_at+32768]
-        pos = 0
-        while pos + 7 <= len(block):
-            _, length, kind = struct.unpack_from('<IHB', block, pos)
-            pos += 7
-            if length == 0 and kind == 0: break
-            if pos + length > len(block): break
-            data = block[pos:pos+length]; pos += length
-            if kind == 1: yield data
-            elif kind == 2: fragments = bytearray(data)
-            elif kind == 3: fragments.extend(data)
-            elif kind == 4:
-                fragments.extend(data); yield bytes(fragments); fragments.clear()
-
 def origin_records():
-    found = {}
-    for filename in sorted(DB.glob('*.log')):
-        for batch in records(filename.read_bytes()):
-            if len(batch) < 12: continue
-            sequence, count = struct.unpack_from('<QI', batch)
-            pos = 12
-            for index in range(count):
-                kind = batch[pos]; pos += 1
-                size, pos = varint(batch, pos)
-                key = batch[pos:pos+size]; pos += size
-                value = None
-                if kind == 1:
-                    size, pos = varint(batch, pos)
-                    value = batch[pos:pos+size]; pos += size
-                elif kind != 0: raise ValueError('Unknown LevelDB record')
-                if key.startswith(ORIGIN):
-                    name = key[len(ORIGIN):].lstrip(b'\x01').decode('utf-8')
-                    previous = found.get(name, (-1, None))
-                    if sequence + index >= previous[0]: found[name] = (sequence+index, value)
-    return found
+    source=DB
+    if not source.is_dir() and source==LOCAL_DATA/'DingTalk_133/Default/Local Storage/leveldb':
+        alternatives=[p/'Default/Local Storage/leveldb' for p in LOCAL_DATA.glob('DingTalk*')
+                      if (p.name=='DingTalk' or p.name.startswith('DingTalk_'))
+                      and (p/'Default/Local Storage/leveldb').is_dir()]
+        if len(alternatives)>1:
+            raise SessionError('检测到多个钉钉数据目录，无法确认当前账号，请核对所用电脑版钉钉')
+        if alternatives:source=alternatives[0]
+    return read_origin(source, ORIGIN)
+
+
+class SessionError(RuntimeError): pass
+class SessionNotFound(SessionError): pass
+class SessionAccountChanged(SessionError): pass
+
 
 def decode_value(value):
     if value is None: return None
@@ -69,25 +40,61 @@ def decode_value(value):
     else: value = value.decode('utf-8')
     try:
         decoded = json.loads(value)
-        return decoded.get('data', decoded) if isinstance(decoded, dict) else decoded
     except (ValueError, TypeError): return value
+    # uni-app writes strings verbatim; JSON-looking text is still a string.
+    # Only a typed storage wrapper may replace the original text.
+    if isinstance(decoded, dict) and set(decoded) == {'type', 'data'}:
+        kind, data = decoded['type'], decoded['data']
+        valid = (
+            kind == 'string' and type(data) is str
+            or kind == 'number' and type(data) in (int, float)
+            or kind == 'boolean' and type(data) is bool
+            or kind == 'object' and (data is None or type(data) in (dict, list))
+        )
+        if valid: return data
+    return value
 
 def read_live_session():
-    origin = {k:decode_value(v) for k, (_,v) in origin_records().items()}
+    current = origin_records()
+    fields = ['token','openid','nickname','phone','code']
+    if not any(key in current or 'uni-'+key in current for key in fields):
+        raise SessionNotFound('本机尚无场馆登录资料')
+    try:
+        origin = {k:decode_value(v) for k, (_,v) in current.items()}
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise SessionError('场馆登录资料格式无效，请在钉钉重新登录') from exc
     def get(key): return origin.get(key, origin.get('uni-'+key))
-    session = {k:get(k) for k in ['token','openid','nickname','phone','code']}
-    if not session['token'] or not session['openid']:
-        raise RuntimeError('No current sports session found')
+    session = {k:get(k) for k in fields}
+    if not all(session.values()):
+        raise SessionError('场馆会话不完整或已注销，请在钉钉重新登录')
     return session
 
-def validate_session(session, valid_until=None):
-    claims = json.loads(base64.urlsafe_b64decode(session['token'].split('.')[1]+'==='))
+
+def _session_claims(session):
+    try:
+        token = session['token']
+        if not isinstance(token,str) or len(token.split('.')) != 3:
+            raise ValueError('Invalid token shape')
+        claims = json.loads(base64.urlsafe_b64decode(token.split('.')[1]+'==='))
+        if not isinstance(claims,dict) or claims.get('openid') is None or not session.get('openid'):
+            raise ValueError('Missing identity')
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise SessionError('场馆登录凭证无效，请在钉钉重新登录') from exc
     if str(claims.get('openid')) != str(session['openid']):
-        raise RuntimeError('Identity mismatch')
+        raise SessionError('场馆登录身份不一致，请在钉钉重新登录')
+    return claims
+
+
+def validate_session(session, valid_until=None):
+    if not isinstance(session,dict) or not all(session.get(key) for key in ('token','openid','nickname','phone','code')):
+        raise SessionError('场馆会话不完整，请在钉钉重新登录')
+    claims = _session_claims(session)
     minimum = max(datetime.now(timezone.utc).timestamp(), valid_until or 0) + 300
-    if claims.get('exp',0) < minimum:
-        raise RuntimeError('场馆登录有效期不足，请在钉钉场馆首页重新登录')
+    expiry = claims.get('exp')
+    if type(expiry) not in (int,float) or not math.isfinite(expiry) or not expiry >= minimum:
+        raise SessionError('场馆登录有效期不足，请在钉钉场馆首页重新登录')
     return session, claims
+
 
 class Blob(ctypes.Structure):
     _fields_ = [('size',wintypes.DWORD),('data',ctypes.POINTER(ctypes.c_ubyte))]
@@ -115,13 +122,33 @@ def protect(data, decrypt=False):
 
 def load_session(valid_until=None):
     try:
-        session, claims = validate_session(read_live_session(),valid_until)
-        PRIVATE.mkdir(parents=True,exist_ok=True)
-        CACHE.write_bytes(protect(json.dumps(session,ensure_ascii=False).encode('utf-8')))
-        return session, claims
-    except (OSError,RuntimeError,ValueError,KeyError):
+        live = read_live_session()
+    except (OSError,SessionNotFound):
         if not CACHE.exists(): raise
         return validate_session(json.loads(protect(CACHE.read_bytes(),decrypt=True)),valid_until)
+    live, claims = validate_session(live,valid_until)
+    if CACHE.exists():
+        try:
+            previous = json.loads(protect(CACHE.read_bytes(),decrypt=True))
+            _session_claims(previous)
+        except (OSError,ValueError,TypeError,SessionError):
+            previous = None
+        if previous is not None and str(previous['openid']) != str(live['openid']):
+            raise SessionAccountChanged('当前钉钉账号与已有场馆会话不同，请确认账号后重试')
+    encrypted = protect(json.dumps(live,ensure_ascii=False).encode('utf-8'))
+    PRIVATE.mkdir(parents=True,exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='.session-',suffix='.tmp',dir=PRIVATE,delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(encrypted)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary,CACHE)
+    finally:
+        if temporary is not None: temporary.unlink(missing_ok=True)
+    return live, claims
+
 
 if __name__ == '__main__':
     _, claims = load_session()

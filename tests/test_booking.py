@@ -17,12 +17,13 @@ def availability(booked=None,opened=None,price=0):
   'extra_list':{'extra_price_time':[11,12] if price else [],'extra_price_list':[price,price] if price else []}}
 
 def order(site=1):
- return {'order_num':'test-order','order_date':'2026-11-05','venue_name':'综合馆羽毛球','site_id':site,'start_time':'19:00','end_time':'21:00'}
+ return {'order_num':'test-order','order_date':'2026-11-05','venue_name':'综合馆羽毛球',
+  'venue_type':'badminton','total_price':0,'site_id':site,'start_time':'19:00','end_time':'21:00'}
 
 class Clock:
  def __init__(self,value=None):self.value=Plan().release.timestamp() if value is None else value
  def now(self):return self.value
- def sync(self,api):pass
+ def sync(self,api,timeout=5):pass
 
 class FakeApi:
  session=SESSION
@@ -31,10 +32,10 @@ class FakeApi:
   self.create=create or Reply(200,{'data':{'order_num':'test-order'}})
   self.order_reads=list(order_reads or [[],[order()]])
   self.snapshot=availability()
- def orders(self,invited=False):
+ def orders(self,invited=False,timeout=5):
   self.calls.append(('orders',invited))
   return self.order_reads.pop(0) if self.order_reads else []
- def call(self,endpoint,payload=None):
+ def call(self,endpoint,payload=None,timeout=5):
   self.calls.append((endpoint,payload))
   if endpoint=='post_site_situation':return Reply(200,self.snapshot)
   result=self.check if endpoint=='creat_book_info' else self.create
@@ -43,9 +44,9 @@ class FakeApi:
 
 class RoutedApi(FakeApi):
  def __init__(self,days=3,order_reads=None):
-  super().__init__(order_reads=order_reads or [[],[],[],[],[order()]])
+  super().__init__(order_reads=order_reads or [[],[],[order()]])
   self.days=days
- def call(self,endpoint,payload=None):
+ def call(self,endpoint,payload=None,timeout=5):
   if endpoint=='post_venue_info':
    self.calls.append((endpoint,payload));return Reply(200,{**META,'days_can_appoint':self.days})
   if endpoint=='post_site_situation':
@@ -99,10 +100,10 @@ class TrialTests(unittest.TestCase):
    {'site_id':2,'book_time_list':[],'oci_time_list':[11,12]}],
    'extra_list':{'extra_price_time':[],'extra_price_list':[]}}
   original=api.call
-  def call(endpoint,payload=None):
+  def call(endpoint,payload=None,timeout=5):
    if endpoint=='creat_book_info' and payload['orderData']['site_id']==1:
     api.calls.append((endpoint,payload));return Reply(200,{'conflict_times':[11],'available_times':[12]})
-   return original(endpoint,payload)
+   return original(endpoint,payload,timeout=timeout)
   api.call=call;trial,_=self.make(api)
   self.assertEqual(trial.attempt(META,[(1,0),(2,0)])['site_id'],2)
   creates=[p for e,p in api.calls if e=='creat_order']
@@ -176,7 +177,7 @@ class TrialTests(unittest.TestCase):
 
  def test_preflight_failure_stops_without_booking(self):
   api=RoutedApi();trial,events=self.make(api)
-  api.orders=lambda invited:(_ for _ in ()).throw(BookingError('登录失效'))
+  api.orders=lambda invited,timeout=5:(_ for _ in ()).throw(BookingError('登录失效'))
   self.assertIsNone(trial.run())
   self.assertEqual(events[-1]['state'],'FAILED')
   self.assertFalse(any(e[0].startswith('creat') for e in api.calls))
@@ -205,12 +206,12 @@ class TrialTests(unittest.TestCase):
   api=FakeApi(order_reads=[[],[active_order]])
   api.snapshot=availability(booked=[booked])
   original=api.call
-  def call(endpoint,payload=None):
+  def call(endpoint,payload=None,timeout=5):
    if endpoint=='creat_book_info':
     api.calls.append((endpoint,payload))
     ids=payload['orderData']['time_list']
     return Reply(200,{'conflict_times':[booked] if booked in ids else [],'available_times':[i for i in ids if i!=booked]})
-   return original(endpoint,payload)
+   return original(endpoint,payload,timeout=timeout)
   api.call=call;trial,events=self.make(api)
   result=trial.attempt(META,[(1,0)])
   self.assertEqual((result['start_time'],result['end_time']),(start,end))

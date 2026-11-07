@@ -10,12 +10,13 @@ from booking import Api,Plan,Trial,Reply,mark_submission,TZ
 
 META={'time_list':['08:00','09:00','10:00','11:00','11:40','13:20','14:00','15:00','16:00','17:00','18:00','19:00','20:00','21:00'],
  'rest_list':[0,1,2,3,9,10,11,12],'base_price':0,'days_can_appoint':3}
-ORDER={'order_num':'SIMULATION_ONLY','order_date':'2026-11-05','venue_name':'综合馆羽毛球','site_id':1,'start_time':'19:00','end_time':'21:00'}
+ORDER={'order_num':'SIMULATION_ONLY','order_date':'2026-11-05','venue_name':'综合馆羽毛球',
+ 'venue_type':'badminton','total_price':0,'site_id':1,'start_time':'19:00','end_time':'21:00'}
 
 class MockApi:
     session={'token':'SIMULATION_ONLY','openid':'SIMULATION_ONLY','nickname':'SIMULATION_ONLY','phone':'SIMULATION_ONLY'}
-    def orders(self,invited=False):return [dict(ORDER)]
-    def call(self,endpoint,payload=None):
+    def orders(self,invited=False,timeout=5):return [dict(ORDER)]
+    def call(self,endpoint,payload=None,timeout=5):
         if endpoint=='creat_book_info':return Reply(200,{'conflict_times':[],'available_times':[11,12]})
         if endpoint=='creat_order':return Reply(200,{'data':{'order_num':'SIMULATION_ONLY'}})
         raise AssertionError('Unexpected mock endpoint')
