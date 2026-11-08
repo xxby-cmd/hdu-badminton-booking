@@ -337,7 +337,7 @@ class Trial:
     CONFLICT_DELAY=.025
 
     def __init__(self,api,plan,publish=None,stop=None,clock=None,shuffle=None,before_create=None,
-                 recovery_until=None,before_attempt=None):
+                 recovery_until=None,before_attempt=None,preflight_check=None,immediate_until=None):
         if not isinstance(plan.release,datetime) or plan.release.tzinfo is None:
             raise ValueError('放场时间必须带时区')
         self.api=api; self.plan=plan
@@ -351,9 +351,18 @@ class Trial:
         self.publish=publish or (lambda **event:None)
         self.stop=stop or threading.Event()
         self.clock=clock or ServerClock()
+        if immediate_until is not None:
+            now=self.clock.now()
+            start=datetime.combine(date.fromisoformat(plan.day),datetime.strptime(plan.start,'%H:%M').time(),TZ).timestamp()
+            if (recovery_until is not None or not isinstance(immediate_until,datetime) or immediate_until.tzinfo is None
+                    or not plan.release.timestamp()<=now<start
+                    or not now<immediate_until.timestamp()<=now+30):
+                raise BookingError('即时预约确认无效或已过期，请刷新后重新确认')
+            self.deadline=immediate_until.timestamp()
         self.shuffle=shuffle or random.SystemRandom().shuffle
         self.before_create=before_create or (lambda plan,site:None)
         self.before_attempt=before_attempt or (lambda:None)
+        self.preflight_check=preflight_check
         self._armed=False
         self._planner=None
         self._prepared={}
@@ -436,6 +445,7 @@ class Trial:
         if any(overlaps(order,self.plan) for order in mine+invited):
             raise BookingError('你在目标时段已有预约或受邀记录，请先在钉钉核对')
         meta=self.read_meta()
+        if self.preflight_check:self.preflight_check(mine,invited,meta)
         self._planner=CandidatePlanner(meta,self.plan)
         courts=self._planner.options(self.read_availability(),self.shuffle)
         self.prepare_payloads(meta,courts)

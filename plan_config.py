@@ -10,6 +10,11 @@ from booking import Plan, TZ, BookingError
 
 SCHEMA = 1
 
+def bookable_days(now=None):
+    now=now or datetime.now(TZ)
+    first=now.date()+timedelta(days=2 if now.hour<20 else 3)
+    return tuple((first+timedelta(days=i)).isoformat() for i in range(7))
+
 def default_config(now=None):
     day = ((now or datetime.now(TZ)).date() + timedelta(days=3)).isoformat()
     return {'schema':SCHEMA, 'day':day, 'start':'15:00', 'end':'17:00',
@@ -17,6 +22,9 @@ def default_config(now=None):
             'max_price':0, 'allow_one_hour':False}
 
 def parse_config(data):
+    if isinstance(data,dict) and data.get('schema')==2:
+        from selection_plan import parse_selection
+        return parse_selection(data)
     if not isinstance(data, dict) or set(data) != set(default_config()):
         raise BookingError('预约配置不完整或版本不匹配，请用界面重新保存')
     if type(data['schema']) is not int or data['schema'] != SCHEMA:
@@ -55,6 +63,9 @@ def parse_config(data):
                 allow_one_hour=False,site_ids=tuple(sorted(sites)))
 
 def ensure_future(plan, now=None):
+    from selection_plan import SelectionPlan,ensure_executable
+    if isinstance(plan,SelectionPlan):
+        return ensure_executable(plan,now)
     if (now or datetime.now(TZ)) >= plan.release:
         raise BookingError('这份计划的放场时间已到或已过，请勿用旧计划重新提交')
 

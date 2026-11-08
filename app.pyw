@@ -4,6 +4,7 @@ from ctypes import wintypes
 from datetime import datetime
 import os
 import json
+import hashlib
 from pathlib import Path
 import threading
 import tkinter as tk
@@ -14,11 +15,15 @@ from event_log import EventLog,EventLogError
 from session import load_session,PRIVATE
 from venue_startup import wait_for_session
 from plan_config import load_config, paths_for
+from selection_plan import SelectionPlan
+from selection_runner import SelectionRunner
+from plan_history import PlanHistory
 
 parser=argparse.ArgumentParser()
 parser.add_argument('--plan',choices=['trial','formal'],default='trial')
 parser.add_argument('--config',type=Path)
 parser.add_argument('--hidden',action='store_true')
+parser.add_argument('--history-id')
 args=parser.parse_args()
 MODE='custom' if args.config else args.plan
 PLAN=load_config(args.config)[1] if args.config else plan_for(MODE)
@@ -30,11 +35,12 @@ STOP_FILE=None
 if args.config:
     configured_paths=paths_for(PLAN,PRIVATE)
     STATE_FILE,EVENTS_FILE,STOP_FILE=(configured_paths[k] for k in ('state','events','stop'))
-END_STATES={'CREATED_PENDING_INVITE','FAILED','UNCERTAIN','STOPPED'}
+END_STATES={'CREATED_PENDING_INVITE','FAILED','UNCERTAIN','STOPPED','PARTIAL_SUCCESS','PARTIAL_UNCERTAIN'}
 LABELS={'STARTING':'正在检查','READY':'已就绪，等待放场','ATTEMPTING':'正在试约',
  'WAITING_LOGIN':'等待钉钉场馆登录','RECOVERING':'正在恢复连接','DIAGNOSING':'正在检查异常原因',
  'VERIFYING':'正在核对订单','CREATED_PENDING_INVITE':'订单已创建，等待你邀请同伴',
- 'FAILED':'本次已停止','UNCERTAIN':'请到钉钉核对结果','STOPPED':'已停止'}
+ 'FAILED':'本次已停止','UNCERTAIN':'请到钉钉核对结果','STOPPED':'已停止',
+ 'PARTIAL_CREATED':'部分订单已核实','PARTIAL_SUCCESS':'部分完成，其余已停止','PARTIAL_UNCERTAIN':'部分已完成，请核对其余结果'}
 
 def refresh_interval(state,seconds_to_release):
     if state in {'ATTEMPTING','VERIFYING','RECOVERING','DIAGNOSING'} or -3<=seconds_to_release<=3:
@@ -59,6 +65,8 @@ def main():
     stop=threading.Event();guard=threading.Lock();clock=ServerClock()
     current={};notified=False
     event_log=EventLog(STATE_FILE,EVENTS_FILE)
+    history=PlanHistory(PRIVATE)
+    config_digest=hashlib.sha256(args.config.read_bytes()).hexdigest() if args.config else None
 
     thread=None
     try:
@@ -70,30 +78,42 @@ def main():
                 event_log.submit(event)
 
         def before_create(active,site):
+            history.assert_active(args.history_id,config_digest)
             try:event_log.check()
             except EventLogError as exc:raise BookingError(str(exc)) from None
             mark_submission(SUBMITTED,active,site)
 
         def before_attempt():
+            history.assert_active(args.history_id,config_digest)
             try:event_log.check()
             except EventLogError as exc:raise BookingError(str(exc)) from None
             mark_submission(VALIDATION_INTENT,PLAN,None,stage='validation_intent')
+        def guard_selection():
+            history.assert_active(args.history_id,config_digest)
+            event_log.check()
 
         def worker():
             kernel.SetThreadExecutionState(0x80000001)
             try:
+                history.assert_active(args.history_id,config_digest)
                 publish(state='STARTING',message='正在检查场馆登录和预约条件')
                 if SUBMITTED.exists() or VALIDATION_INTENT.exists():
                     raise BookingError('已有提交或可能的校验记录，请先核对，勿重启重试')
                 def acquire_session():
+                    if isinstance(PLAN,SelectionPlan) and PLAN.execution_mode=='now':
+                        return load_session()[0]
                     if MODE in ('formal','custom'):
                         return wait_for_session(PLAN.release.timestamp(),stop,publish,load_session)[0]
                     return load_session(PLAN.release.timestamp())[0]
 
                 api=Api(acquire_session())
-                Trial(api,PLAN,publish=publish,stop=stop,clock=clock,
-                    before_create=before_create,before_attempt=before_attempt).run(
-                    refresh_session=acquire_session)
+                if isinstance(PLAN,SelectionPlan):
+                    SelectionRunner(api,PLAN,PRIVATE,publish=publish,stop=stop,clock=clock,
+                                    guard_check=guard_selection).run(refresh_session=acquire_session)
+                else:
+                    Trial(api,PLAN,publish=publish,stop=stop,clock=clock,
+                        before_create=before_create,before_attempt=before_attempt).run(
+                        refresh_session=acquire_session)
             except Stopped as exc:
                 publish(state='STOPPED',message=str(exc))
             except BookingError as exc:

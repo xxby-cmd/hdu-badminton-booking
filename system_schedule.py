@@ -6,12 +6,53 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+import json
+import re
 from booking import TZ, BookingError
 from plan_config import ensure_future, load_config
 
 ROOT=Path(__file__).resolve().parent
 NS='http://schemas.microsoft.com/windows/2004/02/mit/task'
 ET.register_namespace('',NS)
+
+class TaskRegistrationUncertain(BookingError):
+    side_effect_uncertain=True
+    def __init__(self,config,digest,name):
+        super().__init__('任务可能已登记，但回读未完成，请刷新历史核实，勿重复启动')
+        self.details={'config':str(config),'config_sha256':digest,'task_name':name,'pid':None}
+
+def list_booking_tasks():
+    script=("[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); "
+            "Get-ScheduledTask -TaskName 'HDU-Booking-*' -ErrorAction SilentlyContinue | "
+            "ForEach-Object { [pscustomobject]@{name=$_.TaskName; enabled=($_.State.ToString() -ne 'Disabled'); "
+            "arguments=$_.Actions.Arguments} } | ConvertTo-Json -Compress")
+    process=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',script],
+                           capture_output=True,timeout=15,creationflags=subprocess.CREATE_NO_WINDOW)
+    if process.returncode:raise BookingError('无法读取本机预约任务，请稍后刷新历史')
+    raw=process.stdout.decode('utf-8-sig').strip()
+    if not raw:return []
+    rows=json.loads(raw);rows=rows if isinstance(rows,list) else [rows]
+    result=[]
+    for row in rows:
+        args=row.get('arguments','')
+        match=re.search(r'(?:^|\s)--config\s+(?:"([^"]+)"|(\S+))',args)
+        sha=re.search(r'(?:^|\s)--expected-sha256\s+([0-9a-f]{64})(?:\s|$)',args)
+        if match and re.fullmatch(r'HDU-Booking-\d{8}',row.get('name','')):
+            result.append({'name':row['name'],'enabled':row['enabled'],
+                           'config':match.group(1) or match.group(2),'sha256':sha.group(1) if sha else None})
+    return result
+
+def disable_booking_task(name,expected_sha):
+    tasks=list_booking_tasks()
+    current=next((r for r in tasks if r['name']==name),None)
+    if current is None or not current['enabled']:return
+    if not expected_sha or current.get('sha256')!=expected_sha:
+        raise BookingError('系统任务已经发生变化，请刷新历史后再删除，避免误删别的计划')
+    process=subprocess.run(['schtasks.exe','/Change','/TN',name,'/DISABLE'],capture_output=True,
+                           timeout=15,creationflags=subprocess.CREATE_NO_WINDOW)
+    if process.returncode:raise BookingError('无法停用本地定时任务，计划未删除')
+    refreshed=next((r for r in list_booking_tasks() if r['name']==name),None)
+    if refreshed and refreshed['enabled']:raise BookingError('本地任务仍启用，计划未删除')
 
 def command_for(config, expected):
     python=Path(sys.executable)
@@ -67,9 +108,11 @@ def register_task(config, expected, now=None):
     xml=task_xml(plan,config,expected,match.group().decode('ascii'),now)
     name=f'HDU-Booking-{plan.release:%Y%m%d}'
     temporary=None
+    requested=False
     try:
         with tempfile.NamedTemporaryFile(suffix='.xml',delete=False) as f:
             temporary=Path(f.name);f.write(xml.encode('utf-16'))
+        requested=True
         result=subprocess.run(['schtasks.exe','/Create','/TN',name,'/XML',str(temporary),'/F'],
                               capture_output=True,timeout=30,creationflags=subprocess.CREATE_NO_WINDOW)
         if result.returncode:raise BookingError('Windows 定时任务登记失败，请使用当前账户或直接启动')
@@ -94,5 +137,8 @@ def register_task(config, expected, now=None):
         # Query XML is retained only as non-private scheduling evidence by caller if needed.
         return {'task_name':name,'start_at':(plan.release-timedelta(hours=1)).isoformat(),
                 'release':plan.release.isoformat(),'verified':True}
+    except (BookingError,OSError,subprocess.SubprocessError) as exc:
+        if requested:raise TaskRegistrationUncertain(config,expected,name) from exc
+        raise
     finally:
         if temporary:temporary.unlink(missing_ok=True)
