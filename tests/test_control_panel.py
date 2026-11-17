@@ -110,6 +110,36 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(colors.count('#2563eb'),2)
         self.assertEqual(colors.count('#f59e0b'),0)
 
+    def test_first_launch_opens_login_choice_before_background_login(self):
+        p=self.panel
+        with patch('login_settings.LoginSettings') as store, \
+             patch.object(p,'open_startup_settings') as settings, \
+             patch.object(control_panel.threading,'Thread') as thread:
+            store.return_value.path.exists.return_value=False
+            p.prepare_startup_login()
+        settings.assert_called_once()
+        thread.assert_not_called()
+
+    def test_first_launch_manual_login_can_save_without_account_or_password(self):
+        from login_settings import show_settings,LoginSettings
+        p=self.panel
+        with patch('session.PRIVATE',self.private), \
+             patch('login_settings.detect_client',return_value=''), \
+             patch('boot_service.autostart_enabled',return_value=False), \
+             patch('boot_service.set_autostart') as autostart:
+            dialog=show_settings(p)
+            def children(w):
+                for child in w.winfo_children():
+                    yield child
+                    yield from children(child)
+            save=next(w for w in children(dialog) if w.winfo_class()=='TButton' and w.cget('text')=='保存设置')
+            save.invoke()
+            saved=LoginSettings(self.private).read()
+        self.assertFalse(saved['authorized'])
+        self.assertEqual(saved['account'],'')
+        self.assertEqual(saved['password'],'')
+        autostart.assert_called_once_with(False)
+
     def test_empty_selection_with_existing_schedule_shows_time_without_duplicate_start(self):
         p=self.panel;row=self.scheduled_record()
         task={'name':'TEST_ONLY','enabled':True,'sha256':row['config_sha256'],'state':'Ready'}

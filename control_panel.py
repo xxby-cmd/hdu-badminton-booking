@@ -154,6 +154,10 @@ class Panel:
         return self.models.get((self.vars['venue'].get(),self.vars['day'].get()))
     def prepare_startup_login(self):
         from login_settings import LoginSettings,test_login
+        if not LoginSettings(PRIVATE).path.exists():
+            self.set_detail('首次使用：请先选择手动登录或自动登录，可同时设置开机启动。')
+            self.open_startup_settings()
+            return
         generation=self.generation
         self.set_detail('正在打开钉钉并准备场馆登录…')
         def prepare():
@@ -163,6 +167,7 @@ class Panel:
                     message=test_login(store)
                 else:
                     store.launch_client()
+                    os.startfile(ENTRANCE)
                     message='请在钉钉完成登录后刷新排期，可在开机与登录设置中授权自动登录。'
             except Exception:
                 message='登录准备尚未完成，请查看钉钉的登录或验证提示。'

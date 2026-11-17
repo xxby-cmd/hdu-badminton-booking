@@ -282,6 +282,7 @@ def show_settings(panel):
         if path:
             client.set(path)
     ttk.Button(line, text='选择', command=browse).pack(side='right', padx=(8, 0))
+    ttk.Label(frame, text='手动登录：不用填写下方账号密码，直接保存设置。\n自动登录：勾选授权后填写；验证码和设备确认仍由本人完成。',wraplength=590).pack(anchor='w',pady=(10,0))
     ttk.Separator(frame).pack(fill='x', pady=16)
     ttk.Checkbutton(frame, text='我授权本机加密保存账号密码，自动填入钉钉并提交登录',
                     variable=consent).pack(anchor='w')
@@ -331,6 +332,8 @@ def show_settings(panel):
                         message = '登录验证未完成，请在钉钉处理登录或验证码。'
                     panel.messages.put(('login_test', message))
                 threading.Thread(target=verify, daemon=True).start()
+            else:
+                panel.root.after(100,panel.prepare_startup_login)
         except (BookingError, OSError, subprocess.SubprocessError) as exc:
             messagebox.showerror('设置未完成', str(exc) if isinstance(exc, BookingError) else '本机设置保存失败，请检查权限后重试', parent=dialog)
     buttons = ttk.Frame(frame)

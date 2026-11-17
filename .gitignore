@@ -16,3 +16,9 @@ venv/
 *submitted*.json
 *.log
 *.lnk
+
+benchmark-results.json
+打开今晚试约.cmd
+打开明晚正式预约.cmd
+
+!runtime/hdu-runtime-win64.zip
