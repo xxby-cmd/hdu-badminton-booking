@@ -48,8 +48,16 @@ class SelectionRulesTests(unittest.TestCase):
     def test_blue_can_be_unselected_at_limit(self):
         m=GridSelection(DAY,'综合馆羽毛球','badminton',META,stock(),now=datetime(2030,11,7,tzinfo=TZ))
         m.toggle(one());m.toggle(one('16:00','17:00',2))
-        with self.assertRaises(BookingError):m.toggle(one('14:00','15:00',2))
+        self.assertEqual(m.state(one('14:00','15:00',2)),'replaceable')
         m.toggle(one());self.assertEqual(len(m.selected),1);self.assertEqual(m.state(one()),'available')
+    def test_third_distinct_time_restarts_draft_then_allows_second_slot(self):
+        m=GridSelection(DAY,'综合馆羽毛球','badminton',META,stock(),now=datetime(2030,11,7,tzinfo=TZ))
+        m.toggle(one());m.toggle(one('16:00','17:00',2))
+        m.toggle(one('14:00','15:00',2))
+        self.assertEqual(m.selected,{one('14:00','15:00',2)})
+        m.toggle(one())
+        self.assertEqual(m.selected,{one('14:00','15:00',2),one()})
+
     def test_exact_selection_roundtrip(self):
         p=plan([one(),one('16:00','17:00',2)])
         with tempfile.TemporaryDirectory() as directory:

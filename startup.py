@@ -28,13 +28,19 @@ def main():
         result=setup()
         if '--self-check' in sys.argv:
             print(json.dumps(result,ensure_ascii=True));return 0
+        if sys.argv[1:] == ['--autostart']:
+            from boot_service import guardian_main
+            return guardian_main()
         from control_panel import main as panel
         return panel(sys.argv[1:])
     except Exception as exc:
         # Never print session, token, account, or raw traceback in the launch window.
         if isinstance(exc,RuntimeError):message=str(exc)
         else:message='运行环境检查失败。请解压完整文件夹，使用 Windows 10/11 64 位电脑，并保留所有文件。'
-        print(message)
+        if sys.stdout is None:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None,message,'场馆预约助手',0x10)
+        else:print(message)
         return 1
 
 if __name__=='__main__':raise SystemExit(main())

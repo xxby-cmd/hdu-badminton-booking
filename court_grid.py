@@ -62,12 +62,16 @@ class CourtGrid(ttk.Frame):
             c.create_text(10,y+self.CELL_H/2,anchor='w',text=f'{times[row]}–{times[row+1]}',fill='#475569',font=('Microsoft YaHei UI',10))
             for col,site in enumerate(sites):
                 slot=SelectedSlot(times[row],times[row+1],site);state=self.model.state(slot)
-                bg,fg=('#2563eb','white') if state=='selected' else ('white','#64748b') if state=='available' else ('#e5e7eb','#9ca3af')
-                if state=='available' and self.model.existing(slot):bg,fg='#eff6ff','#2563eb'
+                bg,fg=('#f59e0b','#422006') if state=='selected' else ('white','#64748b') if state=='available' else ('#e5e7eb','#9ca3af')
+                if state=='replaceable' or (state=='available' and self.model.existing(slot)):bg,fg='#fff3cd','#92400e'
+                if slot in self.model.replaceable:
+                    bg,fg='#2563eb','white'
                 x=self.TIME_W+col*self.CELL_W
                 border='#0f172a' if (row,col)==self.focus_cell and c.focus_get()==c else '#d5deea'
                 c.create_rectangle(x+3,y+3,x+self.CELL_W-3,y+self.CELL_H-3,fill=bg,outline=border,width=2 if border=='#0f172a' else 1)
                 self.person(x+self.CELL_W/2,y+self.CELL_H/2-1,fg)
+                if slot in self.model.replaceable and slot in self.model.selected:
+                    c.create_oval(x+self.CELL_W-15,y+7,x+self.CELL_W-7,y+15,fill='#f59e0b',outline='white')
     def click(self,event):
         if not self.enabled:return
         item=self.at(event.x,event.y)
@@ -82,9 +86,11 @@ class CourtGrid(ttk.Frame):
         item=self.at(event.x,event.y)
         if item:
             slot=item[2];state=self.model.state(slot)
-            label={'available':'可选','selected':'已选，再点取消'}.get(state,state)
-            if state=='available' and self.model.existing(slot):label='已有同时间本地计划，提交时需确认覆盖'
-            self.canvas.configure(cursor='hand2' if state in ('available','selected') else 'arrow')
+            label={'available':'可选','selected':'待保存选择，再点移除；已保存计划不变','replaceable':'可重新选择；选满后点其他时间会重开草稿，蓝色已保存计划保持有效'}.get(state,state)
+            if state=='available' and self.model.existing(slot):label='可替换已有计划，提交时需确认覆盖'
+            if slot in self.model.replaceable:
+                label='已保存计划，仍然有效；橙色圆点表示也已加入待替换选择' if slot in self.model.selected else '已保存计划，确认替换成功前保持有效'
+            self.canvas.configure(cursor='hand2' if state in ('available','selected','replaceable') else 'arrow')
             self.on_hint(f'{slot.site_id}号场 {slot.start}–{slot.end} · {label}')
     def move(self,dr,dc):
         if self.model is None:return 'break'

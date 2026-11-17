@@ -18,6 +18,7 @@ from plan_config import load_config, paths_for
 from selection_plan import SelectionPlan
 from selection_runner import SelectionRunner
 from plan_history import PlanHistory
+from login_settings import LoginSettings
 
 parser=argparse.ArgumentParser()
 parser.add_argument('--plan',choices=['trial','formal'],default='trial')
@@ -103,7 +104,8 @@ def main():
                     if isinstance(PLAN,SelectionPlan) and PLAN.execution_mode=='now':
                         return load_session()[0]
                     if MODE in ('formal','custom'):
-                        return wait_for_session(PLAN.release.timestamp(),stop,publish,load_session)[0]
+                        return wait_for_session(PLAN.release.timestamp(),stop,publish,load_session,
+                                                assist_login=LoginSettings(PRIVATE).assist_with_retries)[0]
                     return load_session(PLAN.release.timestamp())[0]
 
                 api=Api(acquire_session())

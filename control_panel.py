@@ -12,15 +12,15 @@ import threading
 import tkinter as tk
 from tkinter import ttk,messagebox
 
-from booking import Api,BookingError,TZ
+from booking import Api,BookingError,AuthenticationError,TZ
 from plan_config import default_config,parse_config,load_config,save_config,ensure_future,paths_for,bookable_days
 from selection_plan import (SelectionPlan,SelectedSlot,GridSelection,config_for_slots,
                             ensure_executable,validate_cells)
 from court_grid import CourtGrid
 from schedule_data import ScheduleReader,validate_snapshot
-from session import PRIVATE,read_live_session,validate_session
+from session import PRIVATE,read_live_session,validate_session,SessionError
 from system_schedule import register_task,list_booking_tasks,disable_booking_task
-from plan_history import PlanHistory,ReplaceRequired,slots_for,spans
+from plan_history import PlanHistory,ReplaceRequired,slots_for,spans,BLOCKING,LABELS as HISTORY_LABELS
 from history_view import HistoryWindow
 from venue_startup import ENTRANCE
 
@@ -37,7 +37,7 @@ LABELS={'STARTING':'正在检查预约条件','WAITING_LOGIN':'等待你登录�
         'PARTIAL_SUCCESS':'部分完成，其余已停止','PARTIAL_UNCERTAIN':'部分完成，请核对其余结果'}
 
 class Panel:
-    def __init__(self,root,data,auto_start=False,auto_read=True,sync_history=True):
+    def __init__(self,root,data,auto_start=False,auto_read=True,sync_history=True,enable_tray=True,tray_name=None):
         self.root=root;self.boot_data=data;self.process=None;self.active_plan=None;self.active_pid=None
         self.paths=None;self.progress_index=0;self.messages=queue.Queue();self.closing=False
         self.read_stop=threading.Event();self.reader_thread=None;self.snapshots={};self.models={}
@@ -92,7 +92,7 @@ class Panel:
         left=ttk.Frame(body,style='Card.TFrame',padding=14);left.grid(row=0,column=0,sticky='nsew',padx=(0,14))
         legend=ttk.Frame(left,style='Card.TFrame');legend.pack(fill='x',pady=(0,9))
         ttk.Label(legend,text='场地与时段',style='Card.TLabel',font=('Microsoft YaHei UI',13,'bold')).pack(side='left')
-        for color,label in (('#ffffff','可选'),('#e5e7eb','不可选'),('#eff6ff','已登记'),(BLUE,'已选')):
+        for color,label in (('#ffffff','可选'),('#e5e7eb','不可选'),('#fff3cd','可替换'),('#f59e0b','待保存'),(BLUE,'已保存')):
             swatch=tk.Canvas(legend,width=13,height=13,bg='white',highlightthickness=0)
             swatch.pack(side='left',padx=(16,4));swatch.create_rectangle(1,1,12,12,fill=color,outline='#94a3b8')
             ttk.Label(legend,text=label,style='Hint.TLabel').pack(side='left')
@@ -112,9 +112,15 @@ class Panel:
         detail_window=detail_canvas.create_window(0,0,window=right,anchor='nw')
         right.bind('<Configure>',lambda e:detail_canvas.configure(scrollregion=detail_canvas.bbox('all')))
         detail_canvas.bind('<Configure>',lambda e:detail_canvas.itemconfigure(detail_window,width=e.width))
-        ttk.Label(right,text='本次选择',style='Card.TLabel',font=('Microsoft YaHei UI',15,'bold')).pack(anchor='w')
+        self.preview_heading=ttk.Label(right,text='本次选择',style='Card.TLabel',font=('Microsoft YaHei UI',15,'bold'))
+        self.preview_heading.pack(anchor='w')
         self.preview=ttk.Label(right,text='',style='Card.TLabel',wraplength=245,justify='left')
         self.preview.pack(fill='x',pady=(16,10))
+        plan_actions=ttk.Frame(right,style='Card.TFrame');plan_actions.pack(fill='x',pady=(0,12))
+        self.edit_plan_button=ttk.Button(plan_actions,text='更改计划',command=self.edit_current_plan,state='disabled')
+        self.edit_plan_button.pack(side='left',expand=True,fill='x',padx=(0,5))
+        self.delete_plan_button=ttk.Button(plan_actions,text='删除计划',command=self.delete_current_plan,state='disabled')
+        self.delete_plan_button.pack(side='left',expand=True,fill='x')
         self.rules=ttk.Label(right,text='每天同场馆最多 2 个时段\n同一时间只能预约一片场地\n受邀或已有预约的时间不可选\n仅免费，成功后 10 分钟内邀请',style='Hint.TLabel',wraplength=245,justify='left')
         self.rules.pack(fill='x',pady=(0,14))
         ttk.Separator(status_area).pack(fill='x',pady=4)
@@ -130,15 +136,44 @@ class Panel:
         self.schedule=ttk.Button(actions,text='设为定时启动',command=self.schedule_plan);self.schedule.pack(fill='x',pady=5)
         self.stop=ttk.Button(actions,text='停止后续提交',command=self.request_stop,state='disabled');self.stop.pack(fill='x',pady=5)
         bottom=ttk.Frame(root,padding=(26,0,26,15));bottom.pack(fill='x')
-        self.load_info=ttk.Label(bottom,text='浅蓝格已有本地计划，提交时需确认覆盖；可到历史中删除或改场地。',foreground=MUTED);self.load_info.pack(side='left')
+        self.load_info=ttk.Label(bottom,text='蓝色为已保存计划，橙色为待保存选择；确认替换成功后才更新蓝色。',foreground=MUTED);self.load_info.pack(side='left')
         self.history_button=ttk.Button(bottom,text='历史记录 / 更改场地',command=self.open_history);self.history_button.pack(side='right')
+        self.startup_settings=ttk.Button(bottom,text='开机与登录设置',command=self.open_startup_settings)
+        self.startup_settings.pack(side='right',padx=8)
         self.update_days();self.selection_changed()
+        self.tray=None;self.hidden_dialogs=[]
+        if enable_tray:
+            from tray_icon import TrayIcon
+            self.tray=TrayIcon(self.messages,tray_name)
+            root.bind('<Destroy>',self.on_destroy,add='+')
         root.protocol('WM_DELETE_WINDOW',self.close);root.after(200,self.poll)
         if auto_start:root.after(100,self.begin_configured)
-        elif auto_read:root.after(250,self.read_week)
+        elif auto_read:root.after(250,self.prepare_startup_login)
 
     def current_model(self):
         return self.models.get((self.vars['venue'].get(),self.vars['day'].get()))
+    def prepare_startup_login(self):
+        from login_settings import LoginSettings,test_login
+        generation=self.generation
+        self.set_detail('正在打开钉钉并准备场馆登录…')
+        def prepare():
+            try:
+                store=LoginSettings(PRIVATE)
+                if store.read()['authorized']:
+                    message=test_login(store)
+                else:
+                    store.launch_client()
+                    message='请在钉钉完成登录后刷新排期，可在开机与登录设置中授权自动登录。'
+            except Exception:
+                message='登录准备尚未完成，请查看钉钉的登录或验证提示。'
+            self.messages.put(('startup_login',generation,message))
+        threading.Thread(target=prepare,daemon=True).start()
+    def open_startup_settings(self):
+        try:
+            from login_settings import show_settings
+            show_settings(self)
+        except (BookingError,OSError,ValueError,subprocess.SubprocessError):
+            self.error('开机与登录设置暂时无法读取，请检查本机账户权限。',True)
     def update_days(self):
         for day,button in self.day_buttons.items():
             button.configure(style='Selected.Day.TButton' if day==self.vars['day'].get() else 'Day.TButton')
@@ -173,20 +208,132 @@ class Panel:
     def selection_changed(self):
         if self.process is not None:return
         model=self.current_model();selected=sorted(model.selected) if model else []
+        existing=self.current_history_plan()
+        editable=existing and existing['status']=='scheduled' and not self.history_error
+        for button in (self.edit_plan_button,self.delete_plan_button):button.configure(state='normal' if editable else 'disabled')
         lines=[self.vars['day'].get(),self.vars['venue'].get(),'']
+        self.preview_heading.configure(text='本次选择')
         if selected:
+            self.preview_heading.configure(text='待替换选择' if existing else '待保存选择')
             plan=model.plan()
             lines.extend(f'{s.site_id}号场  {s.start}–{s.end}' for s in selected)
             lines.extend(['',f'已选 {len(selected)} / 2 个时段',f'预计 {len(plan.groups())} 笔订单 · 免费'])
             if len(plan.groups())==2:lines.append('分为两单，成功后分别邀请同伴')
             future=plan.release>datetime.now(TZ)
-            self.start.configure(text='开始等待放场')
+            if existing and self.selection_matches_history(existing,model):
+                title,description=self.history_plan_description(existing)
+                self.heading.configure(text=title);self.set_detail(description)
+                self.start.configure(text='查看已有计划')
+            else:
+                self.heading.configure(text='所选时段尚未确认')
+                self.set_detail('橙色为待替换选择，蓝色原计划仍然有效；确认替换成功后才更新原计划。' if existing else '橙色为待保存选择，请确认后保存。')
+                self.start.configure(text='确认替换计划' if existing and existing['status']=='scheduled' else '开始等待放场')
             self.schedule.configure(state='normal' if future else 'disabled')
             lines.extend(['',f'放场：{plan.release:%m月%d日 %H:%M}'])
         else:
-            lines.extend(['点击可选格子后变为蓝色','最多选择两个不重叠的时段'])
-            self.start.configure(text='开始所选计划')
+            if existing:
+                title,description=self.history_plan_description(existing)
+                self.preview_heading.configure(text='已保存计划')
+                lines=[description]
+                self.heading.configure(text=title);self.set_detail(description)
+                self.start.configure(text='查看已有计划')
+            else:
+                lines.extend(['点击可选格子后变为蓝色','最多选择两个不重叠的时段'])
+                self.heading.configure(text='尚未选择时段' if not self.history_error else '计划状态待核实')
+                self.set_detail('请先点选需要预约的时段。' if not self.history_error else '本地计划状态尚未核实，请刷新历史后再操作。')
+                self.start.configure(text='开始所选计划')
         self.preview.configure(text='\n'.join(lines))
+    def delete_current_plan(self):
+        row=self.current_history_plan()
+        if self.process is not None or not row or row['status']!='scheduled':
+            self.error('仅可删除尚未启动的本地计划，请先核对历史。');return
+        if not messagebox.askyesno('删除本地计划','删除后将停用对应定时任务。不会取消学校订单。确认删除？',parent=self.root):return
+        try:
+            self.delete_history_plan(row['id'])
+            self.selection_changed()
+        except (BookingError,OSError,ValueError) as exc:self.error(str(exc),True)
+
+    def edit_current_plan(self):
+        row=self.current_history_plan();model=self.current_model()
+        if self.process is not None or not row or row['status']!='scheduled' or model is None:
+            self.error('请先读取排期；仅能更改尚未启动的本地计划。');return
+        original=set(model.selected)
+        try:
+            model.selected.clear()
+            for slot in slots_for(row['data'],model.meta):
+                if not slot.site_id:raise BookingError('任意场地计划请到历史记录中更改场地。')
+                model.toggle(slot)
+        except (BookingError,ValueError) as exc:
+            model.selected=original;self.error(str(exc),True);return
+        self.grid.draw();self.selection_changed()
+        self.show_hint('已载入原计划。蓝色原计划保持有效。新选择用橙色显示；确认整体替换成功后才更新蓝色。')
+
+    def current_history_plan(self):
+        try:
+            records=[r for r in reversed(self.history.records())
+                     if r['data']['day']==self.vars['day'].get()
+                     and r['data']['venue']==self.vars['venue'].get()
+                     and r['status'] not in ('deleted','superseded')]
+            return next((r for r in records if r['status'] in BLOCKING),None)
+        except (BookingError,OSError,KeyError):
+            self.history_error=True
+            return None
+    def history_plan_description(self,row):
+        try:plan=parse_config(row['data'])
+        except BookingError:
+            self.history_error=True
+            return '计划数据待核实','本地计划格式无法校验，请保留历史记录并检查后再启动。'
+        scope=f'{plan.day} {plan.venue}\n'+ '、'.join(a+'–'+b for a,b in spans(row['data']))
+        scope+='\n场地：'+('任意场地' if not plan.site_ids else '、'.join(map(str,plan.site_ids))+'号场')
+        if row['status']=='scheduled':
+            when=plan.release-timedelta(hours=1)
+            return '已登记定时启动',scope+f'\n计划启动：{when:%Y年%m月%d日 %H:%M}\n放场：{plan.release:%m月%d日 %H:%M}\n无需重复开始，可在历史记录中更改。'
+        title=HISTORY_LABELS.get(row['status'],'计划状态待核实')
+        if row['status'] in BLOCKING:
+            text='已有该日期的活动计划，无需重复开始。请在历史记录中查看状态。'
+        else:
+            text='请查看历史中的原因；如需重新安排，请先选取时段。'
+        return title,scope+'\n'+text
+    def selection_matches_history(self,row,model):
+        if not model or not model.selected:return True
+        if row['status'] not in BLOCKING:return False
+        try:
+            original=set(slots_for(row['data'],model.meta))
+            return model.selected==original if model.replace_all else model.selected.issubset(original)
+        except BookingError:return False
+    def show_existing_plan(self):
+        row=self.current_history_plan()
+        if not row:return False
+        model=self.current_model()
+        if not self.selection_matches_history(row,model):return False
+        title,text=self.history_plan_description(row)
+        warning=self.history_error
+        if row['status']=='scheduled':
+            try:
+                tasks=list_booking_tasks()
+            except (BookingError,OSError,ValueError,subprocess.SubprocessError):
+                self.heading.configure(text='定时状态暂无法核实')
+                text='该日期已有本地计划，暂时无法读取系统任务状态。请稍后刷新历史记录，无需重复新建。'
+                self.set_detail(text);messagebox.showwarning('定时状态暂无法核实',text,parent=self.root)
+                return True
+            task=next((t for t in tasks if t['name']==row.get('task_name')),None)
+            if not task or not task['enabled'] or task.get('sha256')!=row.get('config_sha256'):
+                title='定时任务待核对'
+                text='该日期已有本地计划，但对应定时任务未启用或配置已变化。请在历史记录中核对后重新登记。'
+                warning=True
+            elif task.get('state')=='Running':
+                title='计划正在启动'
+                text='对应定时任务已经启动，正在检查登录和预约条件，无需重复开始。'
+        elif row['status'] in ('waiting','running','starting'):
+            from boot_service import process_matches
+            if not process_matches(row):
+                title='运行状态待核实'
+                text='该日期已有启动记录，但原进程已结束。请在历史记录中核对当前任务状态。'
+                warning=True
+        self.heading.configure(text=title);self.set_detail(text)
+        if warning:messagebox.showwarning(title,text,parent=self.root)
+        else:messagebox.showinfo(title,text,parent=self.root)
+        return True
     def show_hint(self,text):self.hint.configure(text=text)
     def set_detail(self,text):
         self.detail.configure(state='normal')
@@ -195,6 +342,7 @@ class Panel:
     def data(self,execute=False):
         model=self.current_model()
         if model is None:raise BookingError('请先登录并刷新所选日期的排期')
+        if not model.selected:raise BookingError('请先点选需要预约的时段，或到历史记录中查看已有计划')
         now=datetime.now(TZ)
         if model.day not in bookable_days(now):raise BookingError('此日期已过可选窗口，请选择新的日期')
         account=self.snapshots[(model.venue,model.day)].get('identity_hash')
@@ -216,7 +364,7 @@ class Panel:
         self.set_detail(text);messagebox.showerror('请检查预约设置',text,parent=self.root)
     def set_running(self,running):
         self.venue.configure(state='disabled' if running else 'readonly')
-        for button in (*self.day_buttons.values(),self.start,self.schedule,self.refresh,self.catalog):
+        for button in (*self.day_buttons.values(),self.start,self.schedule,self.refresh,self.catalog,self.edit_plan_button,self.delete_plan_button):
             button.configure(state='disabled' if running else 'normal')
         self.stop.configure(state='normal' if running else 'disabled')
         self.grid.enabled=not running
@@ -268,16 +416,17 @@ class Panel:
         if self.process is not None:return
         try:
             if self.history_error:raise BookingError('历史记录同步失败，请先刷新历史，避免重复登记')
+            if self.show_existing_plan():return
             data,plan=self.data()
             paths=paths_for(plan,PRIVATE)
             if paths['validation'].exists() or paths['submitted'].exists():raise BookingError('该放场日已有提交记录，请到历史核对')
-            row,merged=self.history.apply(data,self.current_model().meta,mode,self.activate,replace,expected_id)
+            row,merged=self.history.apply(data,self.current_model().meta,mode,self.activate,replace,expected_id,replace_all=self.current_model().replace_all)
             if self.process is None:
                 self.refresh_blocks(clear=True)
                 self.set_detail(('已更新同一天的原计划。\n' if merged else '已登记本地计划。\n')+row.get('message','')+'\n可在历史记录里删除或更改场地。')
         except ReplaceRequired as exc:
             description='、'.join(a+'–'+b for a,b in spans(exc.record['data']))
-            if messagebox.askyesno('确认覆盖已有时段',description+'\n已存在本地计划。是否用新选场地覆盖重叠时段？其他时段保留。',parent=self.root):
+            if messagebox.askyesno('确认覆盖已有时段',description+'\n是否用当前所选时段整体替换原计划？原计划未选中的时段将移除。' if self.current_model().replace_all else description+'\n已存在本地计划。是否用新选场地覆盖重叠时段？其他时段保留。',parent=self.root):
                 self.submit(mode,replace=True,expected_id=exc.record['id'])
         except (BookingError,OSError,subprocess.SubprocessError):self.error('登记失败，请检查日期与系统任务权限。',True)
     def open_login(self):
@@ -301,7 +450,8 @@ class Panel:
     def refresh_blocks(self,clear=False):
         if self.process is not None:return
         if clear:
-            for model in self.models.values():model.selected.clear()
+            for model in self.models.values():
+                model.selected.clear();model.replace_all=False
         for snapshot in list(self.snapshots.values()):self.accept_snapshot(snapshot)
         self.history_stamp=self.history.path.stat().st_mtime_ns if self.history.path.exists() else 0
     def delete_history_plan(self,record_id):
@@ -341,12 +491,8 @@ class Panel:
                             blocked=blocked,reserved_count=reserved,replaceable=replaceable)
         same_account=old and self.snapshots[key].get('identity_hash')==snapshot.get('identity_hash')
         if same_account:
+            model.replace_all=old.replace_all
             for slot in sorted(old.selected):
-                try:model.toggle(slot)
-                except BookingError:pass
-        elif (self.boot_data.get('schema')==2 and self.boot_data['day']==snapshot['day'] and self.boot_data['venue']==snapshot['venue']
-              and self.boot_data.get('account_hash')==snapshot.get('identity_hash') and not replaceable):
-            for slot in parse_config(self.boot_data).selections:
                 try:model.toggle(slot)
                 except BookingError:pass
         if old and not same_account:self.show_hint('登录账号已变化，已清空原账号的选格，请重新选择。')
@@ -368,7 +514,9 @@ class Panel:
                 try:
                     ScheduleReader(PRIVATE).read_week(venue,kind,lambda s:self.messages.put(('snapshot',generation,s)),stop)
                     self.messages.put(('loaded',generation))
-                except Exception:self.messages.put(('read_error',generation))
+                except SessionError:self.messages.put(('read_error',generation,'login'))
+                except AuthenticationError:self.messages.put(('read_error',generation,'auth'))
+                except Exception:self.messages.put(('read_error',generation,'other'))
             self.reader_thread=threading.Thread(target=read,daemon=True);self.reader_thread.start()
         start_after_previous()
     def read_catalog(self):
@@ -393,7 +541,9 @@ class Panel:
                     if api.connection:api.connection.close()
                 if not names:raise BookingError()
                 self.messages.put(('catalog',names))
-            except Exception:self.messages.put(('catalog_error',))
+            except SessionError:self.messages.put(('catalog_error','login'))
+            except AuthenticationError:self.messages.put(('catalog_error','auth'))
+            except Exception:self.messages.put(('catalog_error','other'))
         threading.Thread(target=read,daemon=True).start()
     def request_stop(self):
         if self.active_pid is None or self.paths is None:return
@@ -419,32 +569,47 @@ class Panel:
             except (BookingError,OSError):self.history_error=True
         while not self.messages.empty():
             event=self.messages.get_nowait()
+            if event[0]=='tray_restore':
+                self.restore_window();continue
+            if event[0]=='tray_exit':
+                self.exit_application();continue
+            if event[0]=='startup_login':
+                if event[1]==self.generation and not self.closing and self.process is None:
+                    self.set_detail(event[2]);self.read_week()
+                continue
             if event[0] in ('catalog','catalog_error') and self.process is not None:continue
             if event[0] in ('snapshot','loaded','read_error') and event[1]!=self.generation:continue
             if event[0]=='snapshot':
                 try:self.accept_snapshot(event[2])
                 except (BookingError,KeyError,ValueError,TypeError):
-                    self.show_hint('学校返回了一份不完整排期，已忽略；可以刷新重试。')
+                    self.show_hint('本地计划状态待核实，请刷新历史记录。' if self.history_error else '学校返回了一份不完整排期，已忽略；可以刷新重试。')
             elif event[0]=='loaded':
                 self.refresh.configure(state='normal' if self.process is None else 'disabled')
-                count=sum(v==self.vars['venue'].get() for v,d in self.models)
+                count=sum(v==self.vars['venue'].get() and d in self.days for v,d in self.models)
                 self.load_info.configure(text=f'已读 {count}/7 天排期 · {datetime.now(TZ):%H:%M} · 放场前仍会复查')
             elif event[0]=='read_error':
                 self.refresh.configure(state='normal' if self.process is None else 'disabled')
-                self.load_info.configure(text='读取未完成，请在电脑钉钉进入场馆首页登录后刷新。')
+                login=len(event)>2 and event[2]=='login'
+                text='场馆登录资料不可用，请在钉钉进入场馆首页登录后刷新。' if login else '排期读取未完成，请检查连接并刷新；学校暂时无法返回数据时可稍后重试。'
+                if len(event)>2 and event[2]=='auth':text='学校要求检查登录或拒绝了本次读取，请在钉钉核对后重试。'
+                self.load_info.configure(text=text)
             elif event[0]=='catalog':
                 self.venues=event[1];self.venue.configure(values=list(self.venues))
                 self.catalog.configure(state='normal' if self.process is None else 'disabled')
                 if self.vars['venue'].get() not in self.venues:self.vars['venue'].set(next(iter(self.venues)));self.change_venue()
             elif event[0]=='catalog_error':
                 self.catalog.configure(state='normal' if self.process is None else 'disabled')
-                self.show_hint('场馆列表读取失败，请确认电脑钉钉的场馆登录。')
+                text='场馆登录资料不可用，请在钉钉场馆页重新登录。' if len(event)>1 and event[1]=='login' else '场馆列表暂时未能读取，请检查连接后重试。'
+                if len(event)>1 and event[1]=='auth':text='学校要求检查登录或拒绝了场馆列表查询，请在钉钉核对后重试。'
+                self.show_hint(text)
             elif event[0]=='school_history':
                 try:event[1].show_school(event[2])
                 except (tk.TclError,BookingError,ValueError,KeyError):pass
             elif event[0]=='school_history_error':
                 try:event[1].message.configure(text='学校历史读取失败，请检查钉钉场馆登录后刷新；本地计划仍可查看。')
                 except tk.TclError:pass
+            elif event[0]=='login_test':
+                self.set_detail(event[1])
         if self.process is not None:
             try:
                 row=json.loads(self.paths['state'].read_text(encoding='utf-8'))
@@ -473,15 +638,35 @@ class Panel:
                 if self.closing:self.root.destroy();return
         self.root.after(250,self.poll)
     def close(self):
-        self.read_stop.set()
+        if self.tray is not None and self.tray.available:
+            self.hidden_dialogs=[]
+            for child in self.root.winfo_children():
+                if isinstance(child,tk.Toplevel) and child.winfo_viewable():
+                    self.hidden_dialogs.append(child);child.withdraw()
+            self.root.withdraw()
+        else:
+            self.set_detail('系统托盘暂时不可用，已最小化到任务栏，预约仍会继续。')
+            self.root.iconify()
+    def restore_window(self):
+        self.root.deiconify();self.root.lift()
+        for dialog in self.hidden_dialogs:
+            if dialog.winfo_exists():dialog.deiconify()
+        self.hidden_dialogs=[]
+    def on_destroy(self,event):
+        if event.widget is self.root and self.tray is not None:
+            self.tray.stop()
+    def exit_application(self):
         if self.process is not None and self.process.poll() is None:
-            if not messagebox.askyesno('停止并退出','关闭将停止后续提交，已发出的请求会先核对完。继续？',parent=self.root):return
+            self.restore_window()
+            if not messagebox.askyesno('停止并退出界面','退出会停止本次后续提交，已发出的请求会先核对。继续？',parent=self.root):return
             self.closing=True;self.request_stop()
         else:self.root.destroy()
+        self.read_stop.set()
 
 def main(argv=None):
     parser=argparse.ArgumentParser()
     parser.add_argument('--config',type=Path);parser.add_argument('--expected-sha256');parser.add_argument('--start',action='store_true')
+    parser.add_argument('--tray',action='store_true')
     args=parser.parse_args(argv)
     try:
         if args.config:data,plan=load_config(args.config,args.expected_sha256)
@@ -492,6 +677,18 @@ def main(argv=None):
         if args.start or args.config:
             root=tk.Tk();root.withdraw();messagebox.showerror('计划未启动',str(exc),parent=root);root.destroy();return 1
         data=default_config()
-    root=tk.Tk();Panel(root,data,args.start);root.mainloop();return 0
+    from tray_icon import DashboardInstance,restore_existing,DASHBOARD
+    instance=None
+    if not args.config:
+        instance=DashboardInstance()
+        if not instance.acquired:
+            if not args.tray:restore_existing()
+            instance.close();return 0
+    try:
+        root=tk.Tk();panel=Panel(root,data,args.start,tray_name=DASHBOARD if instance else None)
+        if args.tray or args.start:panel.close()
+        root.mainloop();return 0
+    finally:
+        if instance:instance.close()
 
 if __name__=='__main__':raise SystemExit(main())

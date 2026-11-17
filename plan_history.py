@@ -1,7 +1,7 @@
 """Persistent local-plan history and time-based admission, independent of court IDs."""
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime,timedelta
 import hashlib
 import json
 import os
@@ -9,7 +9,7 @@ from pathlib import Path
 import time
 import uuid
 from booking import BookingError,TZ,indices,order_date
-from plan_config import parse_config,load_config
+from plan_config import parse_config,load_config,paths_for
 from selection_plan import SelectionPlan,SelectedSlot,config_for_slots
 
 PENDING={'scheduled','waiting','starting','updating','registering'}
@@ -96,10 +96,6 @@ class PlanHistory:
                     same['registration_uncertain']=False
                     same['message']='已对照系统任务核实当前配置'
                     self.save(document)
-                if (same['status'] in ('stopped','failed') and same.get('mode')=='schedule'
-                        and datetime.now(TZ)<plan.release.replace(hour=19)):
-                    same['status']='scheduled';same['message']='系统仍保留尚未到时的定时任务'
-                    self.save(document)
                 return
             for row in rows:
                 if row.get('task_name')==task['name'] and row['status'] in PENDING:row['status']='superseded'
@@ -125,7 +121,7 @@ class PlanHistory:
                     try:reserved+=len(slots_for(data,meta))
                     except BookingError:reserved=2
         return blocked,replaceable,min(2,reserved)
-    def apply(self,data,meta,mode,activate,replace=False,expected_id=None):
+    def apply(self,data,meta,mode,activate,replace=False,expected_id=None,replace_all=False):
         """Reserve first, then side effect. Same-day additions merge into one task."""
         incoming=parse_config(data);new_cells=slots_for(data,meta)
         with self.lock():
@@ -140,13 +136,13 @@ class PlanHistory:
             if old and old['status']!='scheduled':
                 raise BookingError('当天计划已在运行或结果待核实，请先在历史中处理，不得重复提交')
             overlap=old and intersects(spans(old['data']),spans(data))
-            if overlap and not replace:raise ReplaceRequired(deepcopy(old))
+            if old and (overlap or replace_all) and not replace:raise ReplaceRequired(deepcopy(old))
             merged=data
             effective_mode=mode
             if old:
                 old_hash=old['data'].get('account_hash');new_hash=data.get('account_hash')
                 if old_hash and new_hash and old_hash!=new_hash:raise BookingError('两份计划的账号不同，不能合并')
-                kept=[s for s in slots_for(old['data'],meta) if not any(s.start<t.end and s.end>t.start for t in new_cells)]
+                kept=[] if replace_all else [s for s in slots_for(old['data'],meta) if not any(s.start<t.end and s.end>t.start for t in new_cells)]
                 merged=config_for_slots(data['day'],data['venue'],data['venue_type'],kept+new_cells,
                                          account_hash=new_hash or old_hash)
                 parse_config(merged)
@@ -181,7 +177,10 @@ class PlanHistory:
         digest=hashlib.sha256(Path(config).read_bytes()).hexdigest()
         with self.lock():
             doc=self.load();row=next((r for r in reversed(doc['records']) if r.get('config_sha256')==digest),None)
-            if row and row['status'] in ('deleted','superseded','stopping','running','waiting','starting','uncertain','confirmed','partial'):
+            if row and row['status']=='waiting':
+                from boot_service import process_matches
+                self.recover_waiting(row,datetime.now(TZ),process_matches)
+            if row and row['status']!='scheduled':
                 raise BookingError('该计划已删除、已运行或结果待核实，禁止自动重复启动')
             if row is None:
                 if any(r['data']['day']==data['day'] and r['status'] in BLOCKING for r in doc['records']):
@@ -197,6 +196,24 @@ class PlanHistory:
                 row['status']='uncertain' if result is not None else 'failed'
                 self.save(doc);raise
             return deepcopy(row)
+    def recover_waiting(self,row,now,alive):
+        """Called under the history lock by both Windows dispatch and the guardian."""
+        if row['status']!='waiting' or alive(row):return False
+        plan=parse_config(row['data'])
+        if not plan.release-timedelta(hours=1)<=now<plan.release:return False
+        paths=paths_for(plan,self.private)
+        if paths['validation'].exists() or paths['submitted'].exists():return False
+        try:
+            if paths['stop'].exists():
+                stopped=json.loads(paths['stop'].read_text(encoding='utf-8'))
+                if stopped.get('pid')==row.get('pid'):return False
+            event=json.loads(paths['state'].read_text(encoding='utf-8'))
+        except (OSError,ValueError):return False
+        if event.get('pid')!=row.get('pid') or event.get('state') not in ('READY','WAITING_LOGIN','STARTING'):
+            return False
+        row['status']='scheduled'
+        row['message']='上次等待进程已结束，正在恢复原定时计划'
+        return True
     def assert_active(self,record_id,config_sha256=None):
         if not record_id:return
         row=self.find(record_id)

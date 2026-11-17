@@ -20,6 +20,8 @@ REQUIRED_GROUPS = ('test_timing.', 'test_session.', 'test_leveldb_reader.',
 
 def source_hashes(root=ROOT):
     paths = set(root.glob('*.py')) | set(root.glob('*.pyw')) | set(root.glob('*.cmd'))
+    paths.update(root.glob('*.ps1'))
+    paths.update(root.glob('*.vbs'))
     paths.update((root / 'tests').glob('test_*.py'))
     return {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(paths)}

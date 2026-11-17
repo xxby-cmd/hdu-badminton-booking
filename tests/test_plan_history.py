@@ -33,6 +33,25 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(self.history.find(original['id'])['status'],'superseded')
         self.assertEqual(changed['data']['selections'][0]['site_id'],9)
         self.assertEqual(sum(r['status']=='scheduled' for r in self.history.records()),1)
+    def test_whole_plan_replacement_requires_confirmation_even_without_overlap(self):
+        original,_=self.history.apply(selected(),META,'schedule',self.activate)
+        incoming=selected(2,'14:00','15:00')
+        with self.assertRaises(ReplaceRequired):
+            self.history.apply(incoming,META,'schedule',self.activate,replace_all=True)
+        self.assertEqual(len(self.calls),1)
+        changed,_=self.history.apply(incoming,META,'schedule',self.activate,
+                                    replace=True,replace_all=True,expected_id=original['id'])
+        self.assertEqual(changed['data']['selections'],incoming['selections'])
+        self.assertEqual(sum(r['status']=='scheduled' for r in self.history.records()),1)
+
+    def test_importing_enabled_task_cannot_revive_stopped_or_failed_history(self):
+        row,_=self.history.apply(selected(),META,'schedule',self.activate)
+        for state,status in [('STOPPED','stopped'),('FAILED','failed')]:
+            self.history.update_run(row['id'],{'state':state,'message':'TEST_ONLY'})
+            self.history.import_task({'name':'TEST_ONLY','enabled':True,'config':row['config'],'sha256':row['config_sha256']})
+            self.assertEqual(self.history.find(row['id'])['status'],status)
+            self.assertEqual(self.history.blocks('2030-11-10','综合馆羽毛球',META),([],[],0))
+
     def test_delete_releases_and_reselection_creates_new_history_entry(self):
         row,_=self.history.apply(selected(),META,'schedule',self.activate)
         canceled=[]
@@ -98,7 +117,7 @@ class HistoryTests(unittest.TestCase):
         model=GridSelection('2030-11-10','综合馆羽毛球','badminton',META,stock,
                             now=datetime(2030,11,7,tzinfo=TZ),blocked=blocked,replaceable=replaceable,reserved_count=reserved)
         self.assertTrue(model.existing(SelectedSlot('16:00','17:00',2)))
-        self.assertEqual(model.state(SelectedSlot('16:00','17:00',2)),'available')
+        self.assertEqual(model.state(SelectedSlot('16:00','17:00',2)),'replaceable')
     def test_replaced_dispatched_old_config_cannot_launch_or_submit(self):
         old,_=self.history.apply(selected(1),META,'schedule',self.activate)
         new,_=self.history.apply(selected(2),META,'schedule',self.activate,replace=True)

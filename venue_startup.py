@@ -1,6 +1,7 @@
 """Wait for a usable venue login without touching booking endpoints."""
 import os
 import time
+import subprocess
 
 from booking import BookingError, Stopped
 from session import SessionAccountChanged, SessionError
@@ -10,12 +11,13 @@ ENTRANCE = ('dingtalk://dingtalkclient/page/link?'
             '&popup_wnd=true&width=1080&height=860&title=%E5%9C%BA%E9%A6%86%E9%80%9F%E7%BA%A6')
 
 
-def wait_for_session(release, stop, publish, load, *, now=time.time, open_entrance=None):
+def wait_for_session(release, stop, publish, load, *, now=time.time, open_entrance=None, assist_login=None):
     open_entrance = open_entrance or (lambda: os.startfile(ENTRANCE))
     near_release = release - 20 * 60
     opened = [0, 0]
     next_open = float('-inf')
     last_message = None
+    assisted = False
     while True:
         if stop.is_set():
             raise Stopped('脚本已停止')
@@ -35,6 +37,14 @@ def wait_for_session(release, stop, publish, load, *, now=time.time, open_entran
             try:
                 open_entrance()
                 message = '已打开钉钉场馆入口，请在电脑钉钉登录。脚本会自动检查并继续。'
+                if assist_login is not None and not assisted and now() < release - 45:
+                    assisted = True
+                    try:
+                        result = assist_login(release)
+                        if result == 'SUBMITTED':
+                            message = '已按本机授权提交钉钉登录，正在等待场馆会话。验证码或设备确认需本人完成。'
+                    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
+                        message = '自动登录未完成，请在钉钉处理登录或验证码，脚本会继续检查。'
             except OSError:
                 message = '暂时无法打开钉钉场馆入口，脚本会重试；也可以手动打开场馆页。'
         else:

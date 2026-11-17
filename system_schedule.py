@@ -24,7 +24,7 @@ class TaskRegistrationUncertain(BookingError):
 def list_booking_tasks():
     script=("[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); "
             "Get-ScheduledTask -TaskName 'HDU-Booking-*' -ErrorAction SilentlyContinue | "
-            "ForEach-Object { [pscustomobject]@{name=$_.TaskName; enabled=($_.State.ToString() -ne 'Disabled'); "
+            "ForEach-Object { [pscustomobject]@{name=$_.TaskName; state=$_.State.ToString(); enabled=($_.State.ToString() -ne 'Disabled'); "
             "arguments=$_.Actions.Arguments} } | ConvertTo-Json -Compress")
     process=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',script],
                            capture_output=True,timeout=15,creationflags=subprocess.CREATE_NO_WINDOW)
@@ -38,7 +38,7 @@ def list_booking_tasks():
         match=re.search(r'(?:^|\s)--config\s+(?:"([^"]+)"|(\S+))',args)
         sha=re.search(r'(?:^|\s)--expected-sha256\s+([0-9a-f]{64})(?:\s|$)',args)
         if match and re.fullmatch(r'HDU-Booking-\d{8}',row.get('name','')):
-            result.append({'name':row['name'],'enabled':row['enabled'],
+            result.append({'name':row['name'],'enabled':row['enabled'],'state':row.get('state'),
                            'config':match.group(1) or match.group(2),'sha256':sha.group(1) if sha else None})
     return result
 

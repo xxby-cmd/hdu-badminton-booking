@@ -66,7 +66,9 @@ def parse_selection(data):
     if type(data['max_price']) not in (int,float) or data['max_price']!=0:
         raise BookingError('本助手仅支持免费场地')
     rows=data['selections']
-    if not isinstance(rows,list) or not 1<=len(rows)<=2:raise BookingError('每天同一场馆最多选择两个时段')
+    if not isinstance(rows,list):raise BookingError('选中时段格式无效，请重新选择')
+    if not rows:raise BookingError('请先点选需要预约的时段')
+    if len(rows)>2:raise BookingError('每天同一场馆最多选择两个时段')
     slots=[]
     for row in rows:
         if not isinstance(row,dict) or set(row)!={'site_id','start','end'}:raise BookingError('选中格子格式无效')
@@ -154,7 +156,7 @@ class GridSelection:
         self.meta,self.stock=meta,stock
         self.own,self.invited=list(own),list(invited)
         self.now=now or datetime.now(TZ);self.now_provider=(lambda:now) if now is not None else (lambda:datetime.now(TZ))
-        self.selected=set();self.blocked=tuple(blocked);self.reserved_count=reserved_count;self.replaceable=tuple(replaceable)
+        self.selected=set();self.replace_all=False;self.blocked=tuple(blocked);self.reserved_count=reserved_count;self.replaceable=tuple(replaceable)
         self._states={}
         times=meta['time_list']
         for row in stock['site_situation']:
@@ -177,14 +179,19 @@ class GridSelection:
         if slot in self.selected:return 'selected'
         base=self._states.get(slot,'排期未知')
         if base!='available':return base
-        proposed=[*self.selected,slot]
-        replaced=sum(any(s.start<t.end and s.end>t.start for t in proposed) for s in self.replaceable)
+        proposed=self.proposal(slot)
+        replaced=len(self.replaceable)
         if len(proposed)+self.reserved_count-replaced>2:return '当天已有计划占用名额，最多两个时段'
         try:
-            plan=parse_selection(config_for_slots(self.day,self.venue,self.kind,[*self.selected,slot]))
+            plan=parse_selection(config_for_slots(self.day,self.venue,self.kind,proposed))
             validate_quota(plan,self.own,self.invited,self.meta)
         except BookingError as exc:return str(exc)
-        return 'available'
+        return 'replaceable' if self.replaceable or len(proposed)<=len(self.selected) else 'available'
+    def proposal(self,slot):
+        retained=[s for s in self.selected if not (s.start<slot.end and s.end>slot.start)]
+        if len(self.selected)==2 and len(retained)==2:
+            retained=[]
+        return retained+[slot]
     def existing(self,slot):
         return any(s.start<slot.end and s.end>slot.start for s in self.replaceable)
     def expire(self):
@@ -195,7 +202,8 @@ class GridSelection:
     def toggle(self,slot):
         if slot in self.selected:self.selected.remove(slot);return
         state=self.state(slot)
-        if state!='available':raise BookingError(state)
-        self.selected.add(slot)
+        if state not in ('available','replaceable'):raise BookingError(state)
+        self.selected=set(self.proposal(slot))
+        self.replace_all=bool(self.replaceable)
     def plan(self):
         return parse_selection(config_for_slots(self.day,self.venue,self.kind,self.selected))
